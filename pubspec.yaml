@@ -31,8 +31,10 @@ dependencies:
   flutter:
     sdk: flutter
   camera: ^0.11.0+2
-
   audioplayers: ^6.1.0
+  tflite_flutter: ^0.11.0
+  image: ^4.3.0
+
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
@@ -55,6 +57,8 @@ dev_dependencies:
 flutter:
   assets:
     - assets/alert.wav
+    - assets/converted_model.tflite
+    - assets/label.txt
   # The following line ensures that the Material Icons font is
   # included with your application, so that you can use the icons in
   # the material Icons class.
