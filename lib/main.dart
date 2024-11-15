@@ -1,7 +1,10 @@
+import 'dart:collection';
+
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:audioplayers/audioplayers.dart';
+import 'dart:math';
 
 void main() async {
   // Flutter 엔진 초기화
@@ -43,14 +46,52 @@ class DrowsinessDetectionState extends State<DrowsinessDetection> {
 
   // 이미지 처리를 위한 버퍼
   List<List<List<double>>>? _inputBuffer;
-  // 수정된 출력 버퍼 (softmax 출력을 위해 2개의 클래스)
-  final List<double> _outputBuffer = List.filled(2, 0.0);
+  // 출력 버퍼를 24개의 키포인트 좌표를 저장하도록 수정
+  final List<double> _outputBuffer = List.filled(24, 0.0);
 
   // 졸음 감지를 위한 상태 변수들
   int drowsyFrameCount = 0;
-  static const int drowsyFrameThreshold = 15;
+  static const int drowsyFrameThreshold = 8;
+  static const double earThreshold = 0.26; // EAR 임계값 설정
+
+  // EAR 히스토리 저장을 위한 큐
+  final Queue<double> earHistory = Queue<double>();
+  static const int historyMaxLength = 30; // 1초(30fps) 동안의 기록 저장
+
+  // 상태 표시를 위한 변수
+  String eyeState = "측정 중...";
+  Color stateColor = Colors.white;
+
+  // 키포인트를 저장할 리스트 추가
+  List<Offset> keypoints = [];
 
   DateTime? lastAlertTime;
+
+  // EAR 계산 및 상태 업데이트 함수
+  void _updateEyeState(double ear) {
+    // EAR 히스토리 업데이트
+    earHistory.addLast(ear);
+    if (earHistory.length > historyMaxLength) {
+      earHistory.removeFirst();
+    }
+
+    // 현재 상태 판단
+    setState(() {
+      if (ear < earThreshold) {
+        eyeState = "눈 감음";
+        stateColor = Colors.red;
+        drowsyFrameCount++;
+
+        if (drowsyFrameCount >= drowsyFrameThreshold) {
+          _handleDrowsiness();
+        }
+      } else {
+        eyeState = "눈 뜸";
+        stateColor = Colors.green;
+        drowsyFrameCount = 0;
+      }
+    });
+  }
 
   @override
   void initState() {
@@ -94,14 +135,58 @@ class DrowsinessDetectionState extends State<DrowsinessDetection> {
       //..useNnapi = true; // Android Neural Networks API 사용  텐서플로우2.2이상부터 우린 2.14...
 
       _interpreter = await Interpreter.fromAsset(
-        'assets/train_jt_merged_mov2.tflite', //  그나마 조음
+        'assets/y_eye_v2_adam.tflite',
         // 'assets/train_merged_mov2.tflite',//  별로
         // 'assets/train_merged_cnn_light.tflite',// 구림
         options: options,
       );
+      // 모델 정보 출력
+      print('Input tensor shape: ${_interpreter!.getInputTensor(0).shape}');
+      print('Output tensor shape: ${_interpreter!.getOutputTensor(0).shape}');
+      print('Input tensor type: ${_interpreter!.getInputTensor(0).type}');
+      print('Output tensor type: ${_interpreter!.getOutputTensor(0).type}');
     } catch (e) {
       // ignore: avoid_print
       print('Error loading model: $e');
+    }
+  }
+
+  // EAR 계산 함수
+  double calculateEAR(List<double> keypoints) {
+    try {
+      // 키포인트를 (x,y) 쌍으로 변환
+      List<Point> points = [];
+      for (int i = 0; i < keypoints.length; i += 2) {
+        points.add(Point(keypoints[i], keypoints[i + 1]));
+        //print('Point ${i ~/ 2}: (${keypoints[i]}, ${keypoints[i + 1]})');
+      }
+
+      // 수직 거리 계산 (Python의 np.abs() 대신 dart:math의 abs() 사용)
+      num verticalDist1 = (points[1].y - points[5].y).abs(); // 첫 번째 수직선
+      num verticalDist2 = (points[2].y - points[4].y).abs(); // 두 번째 수직선
+
+      // 수평 거리 계산
+      num horizontalDist = (points[0].x - points[3].x).abs(); // 양 끝점 사이의 거리
+
+      // 디버깅을 위한 거리값 출력
+      print('Vertical1: $verticalDist1');
+      print('Vertical2: $verticalDist2');
+      print('Horizontal: $horizontalDist');
+
+      // 0으로 나누기 방지
+      if (horizontalDist < 0.000001) {
+        print('Warning: Horizontal distance is too small');
+        return 0.0;
+      }
+
+      // EAR 계산
+      double ear = (verticalDist1 + verticalDist2) / (2.0 * horizontalDist);
+      print('Calculated EAR: $ear');
+
+      return ear;
+    } catch (e) {
+      print('Error in EAR calculation: $e');
+      return 0.0;
     }
   }
 
@@ -114,7 +199,7 @@ class DrowsinessDetectionState extends State<DrowsinessDetection> {
       final int height = image.height;
       final int uvRowStride = image.planes[1].bytesPerRow;
       final int uvPixelStride = image.planes[1].bytesPerPixel!;
-      //a
+
       // YUV420 형식의 카메라 이미지를 RGB로 변환하고 224x224 크기로 리샘플링
       for (int x = 0; x < 224; x++) {
         for (int y = 0; y < 224; y++) {
@@ -137,11 +222,10 @@ class DrowsinessDetectionState extends State<DrowsinessDetection> {
               .clamp(0, 255);
           int b = (yp + 1.772 * (up - 128)).round().clamp(0, 255);
 
-          // 정규화된 값을 입력 버퍼에 저장
-          // YUV를 RGB로 변환하고 정규화 (-1 ~ 1 범위로) (MobileNetV2 전처리에 맞춤):
-          _inputBuffer![y][x][0] = (r / 127.5) - 1;
-          _inputBuffer![y][x][1] = (g / 127.5) - 1;
-          _inputBuffer![y][x][2] = (b / 127.5) - 1;
+          // MobileNetV2 전처리에 맞춰 -1에서 1 사이로 정규화
+          _inputBuffer![y][x][0] = (r / 127.5) - 1.0;
+          _inputBuffer![y][x][1] = (g / 127.5) - 1.0;
+          _inputBuffer![y][x][2] = (b / 127.5) - 1.0;
         }
       }
 
@@ -153,23 +237,15 @@ class DrowsinessDetectionState extends State<DrowsinessDetection> {
       // 모델 실행
       _interpreter!.run(input, output);
 
-      // softmax 출력 처리
-      // label.txt = [close, open]
-      // output[0][0]은 눈 감은 상태의 확률
-      // output[0][1]은 눈 뜬 상태의 확률
-      final isEyeClosed = output[0][0] > output[0][1]; // 눈 감은 확률이 더 높은 경우
-      print('close, ${output[0][0]}');
-      print('open, ${output[0][1]}');
-      if (isEyeClosed) {
-        drowsyFrameCount++;
-        if (drowsyFrameCount >= drowsyFrameThreshold) {
-          _handleDrowsiness();
-        }
-      } else {
-        drowsyFrameCount = 0;
+      // 출력값을 _outputBuffer에 올바르게 복사
+      for (int i = 0; i < _outputBuffer.length; i++) {
+        _outputBuffer[i] = output[0][i];
       }
+
+      // EAR 계산
+      double ear = calculateEAR(_outputBuffer);
+      _updateEyeState(ear); // 상태 업데이트
     } catch (e) {
-      // ignore: avoid_print
       print('Error processing image: $e');
     } finally {
       isProcessing = false;
@@ -227,9 +303,23 @@ class DrowsinessDetectionState extends State<DrowsinessDetection> {
                 color: Colors.black54,
                 borderRadius: BorderRadius.circular(8),
               ),
-              child: Text(
-                'FPS: 30\n감지 상태: ${isProcessing ? "처리 중" : "대기"}',
-                style: const TextStyle(color: Colors.white),
+              child: Column(
+                children: [
+                  Text(
+                    '현재 EAR: ${calculateEAR(_outputBuffer).toStringAsFixed(3)}',
+                    style: const TextStyle(color: Colors.white),
+                  ),
+                  Text(
+                    '상태: $eyeState',
+                    style: TextStyle(
+                        color: stateColor, fontWeight: FontWeight.bold),
+                  ),
+                  if (drowsyFrameCount > 0)
+                    Text(
+                      '연속 감지: $drowsyFrameCount',
+                      style: const TextStyle(color: Colors.yellow),
+                    ),
+                ],
               ),
             ),
           ),
@@ -247,11 +337,14 @@ class DrowsinessDetectionState extends State<DrowsinessDetection> {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('눈 감은 상태 확률: ${(_outputBuffer[0] * 100).toStringAsFixed(1)}%'),
-            Text('눈 뜬 상태 확률: ${(_outputBuffer[1] * 100).toStringAsFixed(1)}%'),
-            Text('연속 프레임: $drowsyFrameCount'),
+            Text('현재 EAR: ${calculateEAR(_outputBuffer).toStringAsFixed(3)}'),
+            const Text('임계값: $earThreshold'),
+            Text('눈 상태: $eyeState'),
+            Text('연속 프레임: $drowsyFrameCount / $drowsyFrameThreshold'),
             const Text('알림 간격: 5초'),
-            Text('마지막 알림: ${lastAlertTime?.toString() ?? "없음"}'),
+            if (lastAlertTime != null)
+              Text(
+                  '마지막 알림: ${lastAlertTime!.toLocal().toString().split('.')[0]}'),
           ],
         ),
         actions: [
